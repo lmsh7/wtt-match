@@ -12,17 +12,36 @@
 
 ## 安装
 
-### 前置依赖
+### macOS / Linux
 
 ```bash
+# 前置依赖
 brew install ffmpeg yt-dlp
-```
 
-### 安装项目
-
-```bash
+# 安装项目
 uv sync
 ```
+
+### Windows
+
+运行一键安装脚本（自动检测系统代理、安装前置依赖）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+如需手动指定代理：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1 --proxy http://127.0.0.1:7890
+```
+
+脚本会自动完成以下步骤：
+1. 检测并配置 Windows 系统代理
+2. 检查 Python 3.11+
+3. 安装 uv 包管理器
+4. 通过 winget 安装 ffmpeg 和 yt-dlp
+5. 运行 `uv sync` 安装项目依赖
 
 ## 使用
 

@@ -4,14 +4,26 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
+
+
+def _has_http_proxy() -> bool:
+    """Check if an HTTP proxy is configured in the environment."""
+    return bool(
+        os.environ.get("http_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTPS_PROXY")
+    )
 
 
 def check_dependencies() -> None:
@@ -123,6 +135,59 @@ def grab_frame(
     return frame
 
 
+def grab_frame_local(
+    local_path: str,
+    timestamp: float,
+    width: int,
+    height: int,
+) -> np.ndarray | None:
+    """Grab a single frame from a local video file via ffmpeg pipe."""
+    cmd = [
+        "ffmpeg",
+        "-ss", f"{timestamp:.2f}",
+        "-i", local_path,
+        "-frames:v", "1",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-v", "error",
+        "pipe:1",
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg timed out at t=%.1f", timestamp)
+        return None
+
+    expected_size = width * height * 3
+    if len(proc.stdout) != expected_size:
+        stderr_msg = proc.stderr.decode(errors="replace")[:200] if proc.stderr else ""
+        logger.warning(
+            "Frame size mismatch at t=%.1f: got %d, expected %d. stderr: %s",
+            timestamp, len(proc.stdout), expected_size, stderr_msg,
+        )
+        return None
+
+    return np.frombuffer(proc.stdout, dtype=np.uint8).reshape(height, width, 3)
+
+
+def _download_video(video_url: str, output_path: str) -> None:
+    """Download video to a local file using yt-dlp (handles proxy/auth)."""
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo[height<=1080]/best",
+        "--no-warnings",
+        "--no-part",
+        "-o", output_path,
+        video_url,
+    ]
+    logger.info("Downloading video to %s ...", output_path)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"yt-dlp failed to download video:\n{proc.stderr.strip()}"
+        )
+
+
 def extract_frames(
     video_url: str,
     interval: float = 600.0,
@@ -133,8 +198,6 @@ def extract_frames(
     duration = float(info.get("duration", 0))
     width = int(info.get("width", 640))
     height = int(info.get("height", 360))
-    # Always use --get-url for the stream URL (more reliable for ffmpeg)
-    stream_url = get_stream_url(video_url)
     logger.info("Video: %.0fs, %dx%d", duration, width, height)
 
     total_frames = int(duration / interval)
@@ -145,16 +208,36 @@ def extract_frames(
         duration,
     )
 
-    t = 0.0
-    extracted = 0
-    while t < duration:
-        frame = grab_frame(stream_url, t, width, height)
-        if frame is not None:
-            extracted += 1
-            if extracted % 100 == 0:
-                logger.info("Extracted %d/%d frames", extracted, total_frames)
-            yield (t, frame)
-        t += interval
+    use_proxy = _has_http_proxy()
+    if use_proxy:
+        logger.info(
+            "HTTP proxy detected; downloading video locally before extracting frames"
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "video.mp4")
+            _download_video(video_url, local_path)
+            t = 0.0
+            extracted = 0
+            while t < duration:
+                frame = grab_frame_local(local_path, t, width, height)
+                if frame is not None:
+                    extracted += 1
+                    if extracted % 100 == 0:
+                        logger.info("Extracted %d/%d frames", extracted, total_frames)
+                    yield (t, frame)
+                t += interval
+    else:
+        stream_url = get_stream_url(video_url)
+        t = 0.0
+        extracted = 0
+        while t < duration:
+            frame = grab_frame(stream_url, t, width, height)
+            if frame is not None:
+                extracted += 1
+                if extracted % 100 == 0:
+                    logger.info("Extracted %d/%d frames", extracted, total_frames)
+                yield (t, frame)
+            t += interval
 
 
 def extract_frames_parallel(
@@ -165,13 +248,14 @@ def extract_frames_parallel(
     """Extract frames in parallel using a thread pool.
 
     Returns a list of (timestamp, frame) tuples sorted by timestamp.
+    When an HTTP proxy is detected, downloads the video first via yt-dlp
+    (which respects proxy env vars) then extracts frames from the local file.
     """
     check_dependencies()
     info = get_video_info(video_url)
     duration = float(info.get("duration", 0))
     width = int(info.get("width", 640))
     height = int(info.get("height", 360))
-    stream_url = get_stream_url(video_url)
     logger.info("Video: %.0fs, %dx%d", duration, width, height)
 
     timestamps = []
@@ -186,18 +270,44 @@ def extract_frames_parallel(
         max_workers,
     )
 
+    use_proxy = _has_http_proxy()
+    if use_proxy:
+        logger.info(
+            "HTTP proxy detected; downloading video locally before extracting frames"
+        )
+
     results: list[tuple[float, np.ndarray]] = []
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(grab_frame, stream_url, ts, width, height): ts
-            for ts in timestamps
-        }
-        for future in as_completed(futures):
-            ts = futures[future]
-            frame = future.result()
-            if frame is not None:
-                results.append((ts, frame))
+    if use_proxy:
+        # Download video to temp file, then extract frames locally.
+        # This avoids ffmpeg needing to handle HTTPS via proxy.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, "video.mp4")
+            _download_video(video_url, local_path)
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        grab_frame_local, local_path, ts, width, height
+                    ): ts
+                    for ts in timestamps
+                }
+                for future in as_completed(futures):
+                    ts = futures[future]
+                    frame = future.result()
+                    if frame is not None:
+                        results.append((ts, frame))
+    else:
+        stream_url = get_stream_url(video_url)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(grab_frame, stream_url, ts, width, height): ts
+                for ts in timestamps
+            }
+            for future in as_completed(futures):
+                ts = futures[future]
+                frame = future.result()
+                if frame is not None:
+                    results.append((ts, frame))
 
     results.sort(key=lambda x: x[0])
     return results

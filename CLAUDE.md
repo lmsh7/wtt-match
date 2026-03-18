@@ -24,7 +24,16 @@ uv run wtt-match --url <URL> --player "ZHANG"
 
 ## External Dependencies
 
-Requires `ffmpeg` and `yt-dlp` on PATH (`brew install ffmpeg yt-dlp`).
+Requires `ffmpeg` and `yt-dlp` on PATH.
+
+```bash
+# macOS
+brew install ffmpeg yt-dlp
+
+# Linux (Debian/Ubuntu)
+apt-get install -y ffmpeg
+# yt-dlp is installed as a Python dependency via uv sync
+```
 
 ## Architecture
 

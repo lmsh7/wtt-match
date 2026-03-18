@@ -10,6 +10,10 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# 切换到脚本所在目录（右键运行时 $PWD 可能不是项目目录）
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Definition
+Set-Location $scriptDir
+
 function Write-Step { param([string]$msg) Write-Host "`n[*] $msg" -ForegroundColor Cyan }
 function Write-Ok   { param([string]$msg) Write-Host "    [OK] $msg" -ForegroundColor Green }
 function Write-Warn { param([string]$msg) Write-Host "    [!] $msg" -ForegroundColor Yellow }
@@ -254,4 +258,10 @@ if ($proxyConfigured) {
     Write-Host '  $env:HTTP_PROXY="http://127.0.0.1:7890"' -ForegroundColor Gray
     Write-Host '  $env:HTTPS_PROXY="http://127.0.0.1:7890"' -ForegroundColor Gray
     Write-Host ""
+}
+
+# 右键运行时防止窗口一闪而过
+if (-not $env:TERM -and -not $env:WT_SESSION -and -not $env:ConEmuPID) {
+    Write-Host "按任意键退出..." -ForegroundColor Gray
+    $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
 }
